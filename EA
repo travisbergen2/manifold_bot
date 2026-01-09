@@ -1,0 +1,79 @@
+import backtrader as bt
+import numpy as np
+
+class ManifoldAlignmentEA(bt.Strategy):
+    params = {
+        "gamma": 2.5,          # Coherence Strictness [Op 11]
+        "beta_base": 0.02,     # Baseline Insight Threshold [Op 12]
+        "theta": 4,            # Prediction Horizon [Op 13]
+        "eta": 1.2,            # Chaos Sensitivity [Op 10]
+        "lots_max": 0.05,      # Observable Projection size
+        "min_lot": 0.01,       # Broker floor
+        "atr_period": 14,      # Brownian Noise window
+        "max_drawdown": 0.10   # Identity Kill-Switch [Op 3]
+    }
+
+    def __init__(self) -> None:
+        self.dataclose = self.datas[0].close
+        self.ema = bt.indicators.ExponentialMovingAverage(self.dataclose, period=20)
+        self.rsi = bt.indicators.RelativeStrengthIndex(period=14)
+        self.atr = bt.indicators.AverageTrueRange(period=self.params.atr_period)
+        self.order = None
+        self.initial_value = None
+
+    def log(self, txt):
+        print(f"Manifold Log: {txt}")
+
+    def next(self) -> None:
+        if self.initial_value is None:
+            self.initial_value = self.broker.getvalue()
+
+        # 1. Identity Stability Check [Op 3 & 12]
+        current_drawdown = (self.initial_value - self.broker.getvalue()) / self.initial_value
+        if current_drawdown > self.params.max_drawdown:
+            if self.position: self.close()
+            return
+
+        if self.order: return
+
+        # 2. Signal Normalization [Op 11B Mapping]
+        rsi_norm = (self.rsi[0] - 50) / 50.0
+        # Standardizing EMA: 2% deviation = 1.0 weight
+        ema_dist = (self.ema[0] - self.dataclose[0]) / (self.dataclose[0] * 0.02)
+        signals = [np.array([rsi_norm]), np.array([ema_dist])]
+
+        # 3. Trading Coherence [Op 11B]
+        diff_sq = np.linalg.norm(signals[0] - signals[1])**2
+        coherence = np.exp(-self.params.gamma * diff_sq)
+
+        # 4. Adaptive Insight Threshold (Scaling the Manifold)
+        # We lower beta if ATR is low relative to price (e.g. 1H timeframe)
+        # This fixes the 'No Trades' issue on higher resolutions
+        vol_ratio = self.atr[0] / self.dataclose[0]
+        adaptive_beta = self.params.beta_base * (vol_ratio * 100)
+
+        # 5. Expectation Operator & ROI Flow [Op 13 & 11B.4]
+        # w_t = current momentum; expected_drift = future projection
+        w_t = self.dataclose[0] - self.dataclose[-1]
+        expected_drift = w_t * self.params.theta
+        
+        # Combined ROI Flow (Present + Anticipated Future)
+        roi_flow = (w_t + expected_drift) * coherence
+
+        # 6. Dynamic Risk Adjustment [Op 10]
+        risk_reduction = 1 / (1 + (self.atr[0] * self.params.eta))
+        dynamic_lots = max(self.params.min_lot, self.params.lots_max * risk_reduction)
+        dynamic_lots = round(dynamic_lots, 2)
+
+        # 7. Execution [The 3D Observable Shadow]
+        if not self.position:
+            if roi_flow > adaptive_beta:
+                self.order = self.buy(size=dynamic_lots)
+                self.stop_price = self.dataclose[0] - (self.atr[0] * 2.0)
+                self.log(f"BUY: {dynamic_lots} | Coherence: {coherence:.2f} | Flow: {roi_flow:.4f}")
+        else:
+            # Surprise Exit [Op 3] or Future Expectation Mismatch [Op 13.5]
+            expected_reversal = (self.dataclose[0] + expected_drift) < self.dataclose[0]
+            if self.dataclose[0] < self.stop_price or expected_reversal:
+                self.order = self.close()
+                self.log(f"EXIT: Expectation Error or Stop Hit.")
